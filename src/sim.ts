@@ -124,20 +124,17 @@ export function stepMob(m: MobState, speed: number): boolean {
   const nx = clamp(cur.x + m.vx, m.bounds.minX, m.bounds.maxX);
   const ny = clamp(cur.y + m.vy, m.bounds.minY, m.bounds.maxY);
   // Heading from velocity, in degrees with EQ compass convention
-  // (0=N, 90=E, 180=S, 270=W). The world coordinate system used by
-  // showeq has +X = West and +Y = North (loadSOEMap negates the file
-  // axes; MapCanvas's `project` then negates both again when mapping
-  // world to screen). So a positive vx is motion *west* and a positive
-  // vy is motion *north* — atan2(-vx, vy) maps that into compass
-  // degrees. atan2 returns radians measured ccw from +x; we offset by
-  // pi/2 implicitly via the argument swap so 0° points north.
-  // Skip the update when velocity is near-zero — atan2(0,0) is 0
-  // (north), which would visibly snap the FOV cone any time the mob
-  // briefly stops.
+  // (0=N, 90=E, 180=S, 270=W). The demo runs in screen convention
+  // (+X = East, +Y = South — see geometry.ts) so a positive vx is
+  // motion east and a positive vy is motion south. atan2(vx, -vy)
+  // maps that into compass degrees: (0,-1)→0, (1,0)→90, (0,1)→180,
+  // (-1,0)→270. Skip the update when velocity is near-zero —
+  // atan2(0,0) is 0 (north), which would visibly snap the FOV cone
+  // any time the mob briefly stops.
   const speedSq = m.vx * m.vx + m.vy * m.vy;
   if (speedSq > 0.5) {
     cur.heading = (Math.round(
-      (Math.atan2(-m.vx, m.vy) * 180) / Math.PI,
+      (Math.atan2(m.vx, -m.vy) * 180) / Math.PI,
     ) + 360) % 360;
   }
 

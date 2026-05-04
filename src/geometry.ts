@@ -14,7 +14,14 @@ import {
 // Parses the SOE/Brewall .txt map format used by ~/.showeq/maps.
 // The format and coalescing rules mirror showeq-daemon's
 // MapData::loadSOEMap (mapcore.cpp:940). Specifically:
-//   - File X/Y are negated when loaded into world space; Z is not.
+//   - The file's raw X/Y axes are already in screen convention
+//     (+X right = East, +Y down = South). The daemon historically
+//     negated on load into its world (EQ runtime) convention, then
+//     re-negated at proto-serialization time to put coords back into
+//     screen convention on the wire (see showeq-daemon/src/protoencoder.cpp
+//     fillPos / fillMapGeometry, and the seq.v1 Pos message comment).
+//     The demo skips the round-trip — load → emit is identity, no
+//     negation. Z (height) is the same in both conventions and ships raw.
 //   - Each L record is a single segment (x1,y1,z1)→(x2,y2,z2). The
 //     loader coalesces consecutive segments into a polyline when the
 //     previous segment's first endpoint matches the new segment's
@@ -142,13 +149,14 @@ function parseMapFile(text: string, layer: number): {
 
     if (kind === 'L') {
       if (fields.length !== 9) continue;
-      // Daemon negates x/y on load. Round to ints to match the int16
-      // storage on the daemon side — clients render them as-is.
-      const x1 = -Math.round(parseFloat(fields[0]));
-      const y1 = -Math.round(parseFloat(fields[1]));
+      // File coords are already in screen convention; pass through as
+      // the wire value. Round to ints to match the int16 storage on
+      // the daemon side.
+      const x1 = Math.round(parseFloat(fields[0]));
+      const y1 = Math.round(parseFloat(fields[1]));
       const z1 = Math.round(parseFloat(fields[2]));
-      const x2 = -Math.round(parseFloat(fields[3]));
-      const y2 = -Math.round(parseFloat(fields[4]));
+      const x2 = Math.round(parseFloat(fields[3]));
+      const y2 = Math.round(parseFloat(fields[4]));
       const z2 = Math.round(parseFloat(fields[5]));
       const r = parseInt(fields[6], 10) | 0;
       const g = parseInt(fields[7], 10) | 0;
@@ -183,8 +191,8 @@ function parseMapFile(text: string, layer: number): {
       // P record. The label may legitimately contain commas (e.g.
       // "(Mission,Roam)"); rejoin trailing fields so we don't truncate.
       if (fields.length < 8) continue;
-      const x = -Math.round(parseFloat(fields[0]));
-      const y = -Math.round(parseFloat(fields[1]));
+      const x = Math.round(parseFloat(fields[0]));
+      const y = Math.round(parseFloat(fields[1]));
       const z = Math.round(parseFloat(fields[2]));
       const r = parseInt(fields[3], 10) | 0;
       const g = parseInt(fields[4], 10) | 0;
