@@ -16,11 +16,13 @@ import {
   PrefsSnapshotSchema,
   SnapshotSchema,
   SpawnAddedSchema,
+  SpawnPointAddedSchema,
   SpawnPointSchema,
   SpawnPointUpdatedSchema,
   SpawnUpdatedSchema,
   TargetedSchema,
   WornSetSchema,
+  ZoneChangedSchema,
   type Buff,
   type Pref,
   type Spawn,
@@ -121,6 +123,9 @@ const CHAT_LINES = [
 ];
 
 interface Session {
+  // Currently active zone — re-keys the cycleZone "different from
+  // current" check and tags log lines with the right value.
+  zone: string;
   player: Spawn;
   // Persistent MobState for the player — kept on the session so
   // velocity smoothing and the current waypoint survive between
@@ -159,7 +164,12 @@ interface Session {
 // Per-connection state attached to the upgraded WebSocket. Populated
 // in `fetch` from URL query params so `open()` and the message
 // handlers can read it without a side-table lookup.
-type WSData = { zone: string; loaded: LoadResult; spawnCount: number };
+type WSData = {
+  zone: string;
+  loaded: LoadResult;
+  spawnCount: number;
+  cycleSeconds: number;
+};
 type WS = ServerWebSocket<WSData>;
 
 // Default mob count is calibrated for the demo's "feel" — enough mobs
@@ -169,12 +179,23 @@ type WS = ServerWebSocket<WSData>;
 // would say more about the test client than the web client.
 const DEFAULT_SPAWN_COUNT = 14;
 const MAX_SPAWN_COUNT = 5000;
+// Rotate the demo through the allowlist so a sit-and-watch session
+// isn't stuck on a single map. 0 disables — useful when the operator
+// pinned a zone with `?m=` to debug something specific.
+const DEFAULT_CYCLE_SECONDS = 30;
 
 function parseSpawnCount(raw: string | null): number {
   if (raw == null) return DEFAULT_SPAWN_COUNT;
   const n = Number.parseInt(raw, 10);
   if (!Number.isFinite(n) || n < 1) return DEFAULT_SPAWN_COUNT;
   return Math.min(n, MAX_SPAWN_COUNT);
+}
+
+function parseCycleSeconds(raw: string | null): number {
+  if (raw == null) return DEFAULT_CYCLE_SECONDS;
+  const n = Number.parseInt(raw, 10);
+  if (!Number.isFinite(n) || n < 0) return DEFAULT_CYCLE_SECONDS;
+  return n;
 }
 
 const sessions = new WeakMap<WS, Session>();
@@ -223,6 +244,137 @@ function envelope(s: Session, payload: any): Uint8Array {
   return toBinary(EnvelopeSchema, env);
 }
 
+// Build the zone-dependent portion of session state from a loaded
+// geometry. Called once at session start (with a fresh player +
+// player-mob pair) and again on each cycleZone (reusing the existing
+// player + mob pair so the player's identity persists across zones).
+function seedZoneEntities(
+  session: Session,
+  loaded: LoadResult,
+  spawnCount: number,
+): void {
+  const bounds: ZoneBounds = {
+    minX: loaded.geometry.minX, maxX: loaded.geometry.maxX,
+    minY: loaded.geometry.minY, maxY: loaded.geometry.maxY,
+  };
+  const playerAnchor: [number, number] = loaded.spawnAnchors[0]
+    ?? [(bounds.minX + bounds.maxX) >> 1,
+        (bounds.minY + bounds.maxY) >> 1];
+  // Reposition the existing player Spawn instead of rebuilding it —
+  // keeps the same id/name/level/stats across zone changes.
+  const pm = session.playerMob;
+  const ps = session.player.pos!;
+  ps.x = playerAnchor[0];
+  ps.y = playerAnchor[1];
+  ps.vx = 0;
+  ps.vy = 0;
+  pm.vx = 0;
+  pm.vy = 0;
+  pm.anchor = [playerAnchor[0], playerAnchor[1]];
+  pm.bounds = bounds;
+  pm.tx = playerAnchor[0];
+  pm.ty = playerAnchor[1];
+
+  // Player walks a randomized loop of map landmarks so the heading
+  // sweeps through the full compass over the course of a demo session
+  // (rather than nudging in a tiny lissajous around the spawn point).
+  session.waypoints = pickWaypoints(loaded.spawnAnchors, playerAnchor);
+  session.waypointIdx = 0;
+  // Aim the first walking segment immediately so the heading is
+  // populated on the very first tick rather than starting at 0 (north).
+  if (session.waypoints.length > 0) {
+    pm.tx = session.waypoints[0][0];
+    pm.ty = session.waypoints[0][1];
+  }
+
+  const names = loadMobNames(spawnCount);
+  // Mob anchors skip index 0 so they don't all stack on the player.
+  const mobAnchors = loaded.spawnAnchors.length > 1
+    ? loaded.spawnAnchors.slice(1)
+    : loaded.spawnAnchors;
+  session.mobs = buildMobs(names, mobAnchors, bounds);
+  // Stamp categoryIds onto each mob from the seed regex table — the
+  // daemon does this once at SpawnAdded time and never mutates it,
+  // so we match that semantic here.
+  for (const m of session.mobs) {
+    m.spawn.categoryIds = categoryIdsForName(m.spawn.name);
+  }
+  // Promote a small sample of mob anchors into spawn points so the
+  // SpawnPointList renders something. Real SpawnMonitor only promotes
+  // after the second pop at the same coords; the demo skips that
+  // (n=1) and just seeds points directly from the mob set.
+  session.spawnPoints.clear();
+  const nowS = BigInt(Math.floor(Date.now() / 1000));
+  for (const m of session.mobs.slice(0, 6)) {
+    const x = m.spawn.pos!.x, y = m.spawn.pos!.y, z = m.spawn.pos!.z;
+    const key = `${x}|${y}|${z}`;
+    session.spawnPoints.set(key, create(SpawnPointSchema, {
+      key, x, y, z,
+      name: '',
+      last: m.spawn.name,
+      lastId: m.spawn.id,
+      count: 1,
+      spawnTimeS: nowS,
+      // diff_time_s = 360 mimics a 6-minute respawn cycle so the
+      // SpawnPointList countdown column is non-empty.
+      deathTimeS: 0n,
+      diffTimeS: 360n,
+    }));
+  }
+}
+
+// Swap the running session into a different random zone. Mirrors what
+// a zoning EQ client would see: ZoneChanged drops every spawn +
+// SpawnPoint on the showeq-web side; the follow-up SpawnAdded /
+// SpawnPointAdded events repopulate. Static cross-zone state (group,
+// buffs, prefs, categories, items) is not re-sent — the client keeps
+// it.
+function cycleZone(ws: WS, session: Session): void {
+  // Pick a different random zone — bail if 8 retries can't find one
+  // that isn't the current zone (effectively never with a 500+ list).
+  let next: { zone: string; loaded: LoadResult } | null = null;
+  for (let i = 0; i < 8; i++) {
+    const z = ZONE_LIST[Math.floor(Math.random() * ZONE_LIST.length)];
+    if (z === session.zone) continue;
+    const g = getGeometry(z);
+    if (g) { next = { zone: z, loaded: g }; break; }
+  }
+  if (!next) return;
+
+  seedZoneEntities(session, next.loaded, ws.data.spawnCount);
+  session.zone = next.zone;
+  const zoneLong = ZONE_LONG_NAMES[next.zone] ?? next.zone;
+  console.log(`[demo] zone change — zone=${next.zone} mobs=${session.mobs.length}`);
+
+  ws.send(envelope(session, {
+    case: 'zoneChanged',
+    value: create(ZoneChangedSchema, {
+      zoneShort: next.zone,
+      zoneLong,
+      geometry: next.loaded.geometry,
+    }),
+  }));
+  // Re-emit the player so the showeq-web store re-keys it after its
+  // post-zoneChanged spawns.clear(). Same Spawn object, just at the
+  // new anchor.
+  ws.send(envelope(session, {
+    case: 'spawnAdded',
+    value: create(SpawnAddedSchema, { spawn: session.player }),
+  }));
+  for (const m of session.mobs) {
+    ws.send(envelope(session, {
+      case: 'spawnAdded',
+      value: create(SpawnAddedSchema, { spawn: m.spawn }),
+    }));
+  }
+  for (const sp of session.spawnPoints.values()) {
+    ws.send(envelope(session, {
+      case: 'spawnPointAdded',
+      value: create(SpawnPointAddedSchema, { point: sp }),
+    }));
+  }
+}
+
 function startSession(ws: WS): void {
   const { zone, loaded } = ws.data;
   const zoneLong = ZONE_LONG_NAMES[zone] ?? zone;
@@ -240,68 +392,28 @@ function startSession(ws: WS): void {
   const { spawn: playerSpawn, mob: playerMobInit } = buildPlayer(
     PLAYER_ID, playerName, playerAnchor, zoneBounds,
   );
-  // Player walks a randomized loop of map landmarks so the heading
-  // sweeps through the full compass over the course of a demo session
-  // (rather than nudging in a tiny lissajous around the spawn point).
-  const waypoints = pickWaypoints(loaded.spawnAnchors, playerAnchor);
-  // Aim the first walking segment immediately so the heading is
-  // populated on the very first tick rather than starting at 0 (north).
-  if (waypoints.length > 0) {
-    playerMobInit.tx = waypoints[0][0];
-    playerMobInit.ty = waypoints[0][1];
-  }
-  const names = loadMobNames(ws.data.spawnCount);
-  // Mob anchors skip index 0 so they don't all stack on the player.
-  const mobAnchors = loaded.spawnAnchors.length > 1
-    ? loaded.spawnAnchors.slice(1)
-    : loaded.spawnAnchors;
-  const mobs = buildMobs(names, mobAnchors, zoneBounds);
-  // Stamp categoryIds onto each mob from the seed regex table — the
-  // daemon does this once at SpawnAdded time and never mutates it,
-  // so we match that semantic here.
-  for (const m of mobs) {
-    m.spawn.categoryIds = categoryIdsForName(m.spawn.name);
-  }
-  // Promote a small sample of mob anchors into spawn points so the
-  // SpawnPointList renders something. Real SpawnMonitor only promotes
-  // after the second pop at the same coords; the demo skips that
-  // (n=1) and just seeds points directly from the mob set.
-  const spawnPoints = new Map<string, SpawnPoint>();
-  const nowS = BigInt(Math.floor(Date.now() / 1000));
-  for (const m of mobs.slice(0, 6)) {
-    const x = m.spawn.pos!.x, y = m.spawn.pos!.y, z = m.spawn.pos!.z;
-    const key = `${x}|${y}|${z}`;
-    spawnPoints.set(key, create(SpawnPointSchema, {
-      key, x, y, z,
-      name: '',
-      last: m.spawn.name,
-      lastId: m.spawn.id,
-      count: 1,
-      spawnTimeS: nowS,
-      // diff_time_s = 360 mimics a 6-minute respawn cycle so the
-      // SpawnPointList countdown column is non-empty.
-      deathTimeS: 0n,
-      diffTimeS: 360n,
-    }));
-  }
   const session: Session = {
+    zone,
     filters: emptyFilterState(),
     player: playerSpawn,
     playerMob: playerMobInit,
-    waypoints,
+    waypoints: [],
     waypointIdx: 0,
-    mobs,
+    mobs: [],
     prefs: new Map(),
     buffs: buildBuffs(PLAYER_ID, playerName),
-    spawnPoints,
+    spawnPoints: new Map(),
     seq: 0n,
   };
+  // Seed the per-zone entities (mobs, spawn points, waypoints, player
+  // anchor + bounds). cycleZone runs the same path on each rotate.
+  seedZoneEntities(session, loaded, ws.data.spawnCount);
   // Seed the pref store before sending the snapshot — handle messages
   // arriving on the same socket race the snapshot otherwise.
   for (const p of buildPrefs()) session.prefs.set(`${p.section}|${p.key}`, p);
   sessions.set(ws, session);
 
-  console.log(`[demo] new session — zone=${zone} player=${playerName} mobs=${mobs.length}`);
+  console.log(`[demo] new session — zone=${zone} player=${playerName} mobs=${session.mobs.length}`);
 
   // Build worn-set + totals once — the same data ships in the
   // Snapshot and on subsequent ItemCacheTotals/WornSet events.
@@ -319,7 +431,7 @@ function startSession(ws: WS): void {
     zoneShort: zone,
     zoneLong: zoneLong,
     playerId: PLAYER_ID,
-    spawns: [playerSpawn, ...mobs.map((m) => m.spawn)],
+    spawns: [playerSpawn, ...session.mobs.map((m) => m.spawn)],
     geometry: loaded.geometry,
     spawnPoints: [...session.spawnPoints.values()],
     items: buildItems(),
@@ -500,6 +612,14 @@ function startSession(ws: WS): void {
         value: create(SpawnPointUpdatedSchema, { point: sp }),
       }));
     }
+
+    // Periodic zone rotation. cycleSeconds=0 disables (tested first
+    // so the math doesn't trip a tickCount % 0 = NaN). 5 ticks/sec at
+    // TICK_MS=200, so cycleSeconds*5 ticks per rotation.
+    if (ws.data.cycleSeconds > 0
+        && tickCount % (ws.data.cycleSeconds * 5) === 0) {
+      cycleZone(ws, session);
+    }
   }, TICK_MS);
 }
 
@@ -592,7 +712,8 @@ const server = Bun.serve<WSData, never>({
     const url = new URL(req.url);
     const picked = pickZone(url.searchParams.get('m'));
     const spawnCount = parseSpawnCount(url.searchParams.get('spawncount'));
-    if (srv.upgrade(req, { data: { ...picked, spawnCount } })) return;
+    const cycleSeconds = parseCycleSeconds(url.searchParams.get('cycle'));
+    if (srv.upgrade(req, { data: { ...picked, spawnCount, cycleSeconds } })) return;
     return new Response('showeq-web-demo: WebSocket only', { status: 426 });
   },
   websocket: {

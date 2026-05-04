@@ -48,6 +48,12 @@ clamped to `1..5000`). Useful for poking at showeq-web rendering perf
 — at high counts the demo synthesizes suffixed mob names
 (`decaying skeleton, a #042`) once the unique-name pool runs out.
 
+Append `&cycle=N` to control the auto zone-rotation interval in
+seconds (default 30; `cycle=0` disables). Each rotation emits a
+`ZoneChanged` envelope followed by fresh `SpawnAdded` /
+`SpawnPointAdded` events for the new zone — the same shape the daemon
+sends when the player actually zones.
+
 Env vars:
 
 - `PORT=9090` — listen on the daemon's default port instead.
