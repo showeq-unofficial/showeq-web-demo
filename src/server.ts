@@ -202,7 +202,7 @@ const MAX_SPAWN_COUNT = 5000;
 // Rotate the demo through the allowlist so a sit-and-watch session
 // isn't stuck on a single map. 0 disables — useful when the operator
 // pinned a zone with `?m=` to debug something specific.
-const DEFAULT_CYCLE_SECONDS = 30;
+const DEFAULT_CYCLE_SECONDS = 120;
 
 function parseSpawnCount(raw: string | null): number {
   if (raw == null) return DEFAULT_SPAWN_COUNT;
