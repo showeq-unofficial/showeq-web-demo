@@ -26,10 +26,18 @@ import {
   type Spawn,
   type SpawnPoint,
 } from '@gen/seq/v1/events_pb';
+import type { ServerWebSocket } from 'bun';
 import { ClientEnvelopeSchema } from '@gen/seq/v1/client_pb';
-import { loadZoneGeometry } from './geometry.ts';
+import {
+  loadZoneGeometry,
+  scanZoneShorts,
+  SYSTEM_MAPS_DIR,
+  VENDORED_MAPS_DIR,
+  type LoadResult,
+} from './geometry.ts';
 import { loadMobNames, randomPlayerName } from './mobs.ts';
 import { buildMobs, buildPlayer, stepMob, type MobState, type ZoneBounds } from './sim.ts';
+import { ZONE_LONG_NAMES } from './zoneNames.ts';
 import {
   compileRule,
   computeFlags,
@@ -52,37 +60,56 @@ import {
 } from './seed.ts';
 
 const PORT = Number(process.env.PORT ?? 9091);
-const ZONE_SHORT = process.env.ZONE ?? 'nektulos';
-const ZONE_LONG = process.env.ZONE_LONG ?? 'Nektulos Forest';
 const TICK_MS = 200;
 
-// Load geometry once at startup. ~/.showeq/maps/<zone>.txt and the
-// _1/_2 layer overlays are read using the daemon's loadSOEMap rules
-// (mapcore.cpp:940). We exit early with a clear error if the requested
-// zone has no installed map — running the demo without geometry would
-// just give an empty canvas.
-const _loaded = loadZoneGeometry(ZONE_SHORT);
-if (!_loaded) {
+// Build the zone allowlist once at startup by scanning the two
+// candidate dirs (vendored maps/ and the developer-local
+// ~/.showeq/maps). The set returned here is the ONLY input that
+// `?m=<zone>` is validated against — exact-match short-name lookup, no
+// regex sanitization needed because filesystem-traversal characters
+// can't survive scanZoneShorts's `[a-z0-9_-]+\.txt$` filter.
+const ZONE_ALLOWLIST = scanZoneShorts([VENDORED_MAPS_DIR, SYSTEM_MAPS_DIR]);
+if (ZONE_ALLOWLIST.size === 0) {
   console.error(
-    `[demo] no map files found for zone "${ZONE_SHORT}" under ~/.showeq/maps. ` +
-    `Set ZONE=<short_name> to pick a different zone.`,
+    `[demo] no zone .txt files found under ${VENDORED_MAPS_DIR} or ${SYSTEM_MAPS_DIR} — ` +
+    `vendor at least one zone or install legacy showeq maps.`,
   );
   process.exit(1);
 }
-// Re-bind to a non-nullable handle so callers below don't need null
-// guards. The early exit above ensures _loaded was non-null here.
-const loaded = _loaded;
-const ZONE_BOUNDS: ZoneBounds = {
-  minX: loaded.geometry.minX, maxX: loaded.geometry.maxX,
-  minY: loaded.geometry.minY, maxY: loaded.geometry.maxY,
-};
-console.log(
-  `[demo] zone=${ZONE_SHORT} bounds=` +
-  `(${ZONE_BOUNDS.minX},${ZONE_BOUNDS.minY})..(${ZONE_BOUNDS.maxX},${ZONE_BOUNDS.maxY}) ` +
-  `lines=${loaded.geometry.lines.length} ` +
-  `locs=${loaded.geometry.locations.length} ` +
-  `anchors=${loaded.spawnAnchors.length}`,
-);
+const ZONE_LIST = [...ZONE_ALLOWLIST];
+console.log(`[demo] zone allowlist: ${ZONE_ALLOWLIST.size} zones`);
+
+// Geometry parse runs once per zone — popular zones (or the same zone
+// re-picked by the random fallback) reuse the cached parse instead of
+// re-reading + re-parsing the .txt files on every connection.
+const geomCache = new Map<string, LoadResult>();
+function getGeometry(zone: string): LoadResult | null {
+  let g = geomCache.get(zone);
+  if (g) return g;
+  const loaded = loadZoneGeometry(zone);
+  if (loaded) geomCache.set(zone, loaded);
+  return loaded;
+}
+
+// Pick a zone for a connection: requested if it's on the allowlist
+// AND its geometry actually parses, otherwise fall back to a random
+// allowlist entry. The double-check (allowlist + parses) protects
+// against a zone whose base file exists but is empty/malformed.
+function pickZone(requested: string | null): { zone: string; loaded: LoadResult } {
+  if (requested && ZONE_ALLOWLIST.has(requested)) {
+    const g = getGeometry(requested);
+    if (g) return { zone: requested, loaded: g };
+  }
+  // Random fallback. Reroll up to a few times if a picked zone fails
+  // to load; in practice the curated set parses cleanly so this
+  // should resolve on the first try.
+  for (let i = 0; i < 8; i++) {
+    const z = ZONE_LIST[Math.floor(Math.random() * ZONE_LIST.length)];
+    const g = getGeometry(z);
+    if (g) return { zone: z, loaded: g };
+  }
+  throw new Error('[demo] no loadable zone in allowlist after 8 retries');
+}
 // Visible in the chat log so the demo doesn't feel empty even before
 // any mobs move.
 const CHAT_LINES = [
@@ -129,7 +156,28 @@ interface Session {
   ticker?: ReturnType<typeof setInterval>;
 }
 
-const sessions = new WeakMap<WebSocket, Session>();
+// Per-connection state attached to the upgraded WebSocket. Populated
+// in `fetch` from URL query params so `open()` and the message
+// handlers can read it without a side-table lookup.
+type WSData = { zone: string; loaded: LoadResult; spawnCount: number };
+type WS = ServerWebSocket<WSData>;
+
+// Default mob count is calibrated for the demo's "feel" — enough mobs
+// to populate a SpawnList without crowding the canvas. The cap is
+// chosen so a malicious or fat-fingered query can't allocate
+// unbounded simulation state; rendering-perf testing past this point
+// would say more about the test client than the web client.
+const DEFAULT_SPAWN_COUNT = 14;
+const MAX_SPAWN_COUNT = 5000;
+
+function parseSpawnCount(raw: string | null): number {
+  if (raw == null) return DEFAULT_SPAWN_COUNT;
+  const n = Number.parseInt(raw, 10);
+  if (!Number.isFinite(n) || n < 1) return DEFAULT_SPAWN_COUNT;
+  return Math.min(n, MAX_SPAWN_COUNT);
+}
+
+const sessions = new WeakMap<WS, Session>();
 
 function nextSeq(s: Session): bigint {
   s.seq += 1n;
@@ -175,16 +223,22 @@ function envelope(s: Session, payload: any): Uint8Array {
   return toBinary(EnvelopeSchema, env);
 }
 
-function startSession(ws: WebSocket): void {
+function startSession(ws: WS): void {
+  const { zone, loaded } = ws.data;
+  const zoneLong = ZONE_LONG_NAMES[zone] ?? zone;
+  const zoneBounds: ZoneBounds = {
+    minX: loaded.geometry.minX, maxX: loaded.geometry.maxX,
+    minY: loaded.geometry.minY, maxY: loaded.geometry.maxY,
+  };
   const playerName = randomPlayerName();
   const PLAYER_ID = 1;
   // Drop the player at the first available anchor (or the bounding-box
   // center if there are none) so the FOV cone has something to point at.
   const playerAnchor: [number, number] = loaded.spawnAnchors[0]
-    ?? [(ZONE_BOUNDS.minX + ZONE_BOUNDS.maxX) >> 1,
-        (ZONE_BOUNDS.minY + ZONE_BOUNDS.maxY) >> 1];
+    ?? [(zoneBounds.minX + zoneBounds.maxX) >> 1,
+        (zoneBounds.minY + zoneBounds.maxY) >> 1];
   const { spawn: playerSpawn, mob: playerMobInit } = buildPlayer(
-    PLAYER_ID, playerName, playerAnchor, ZONE_BOUNDS,
+    PLAYER_ID, playerName, playerAnchor, zoneBounds,
   );
   // Player walks a randomized loop of map landmarks so the heading
   // sweeps through the full compass over the course of a demo session
@@ -196,12 +250,12 @@ function startSession(ws: WebSocket): void {
     playerMobInit.tx = waypoints[0][0];
     playerMobInit.ty = waypoints[0][1];
   }
-  const names = loadMobNames(14);
+  const names = loadMobNames(ws.data.spawnCount);
   // Mob anchors skip index 0 so they don't all stack on the player.
   const mobAnchors = loaded.spawnAnchors.length > 1
     ? loaded.spawnAnchors.slice(1)
     : loaded.spawnAnchors;
-  const mobs = buildMobs(names, mobAnchors, ZONE_BOUNDS);
+  const mobs = buildMobs(names, mobAnchors, zoneBounds);
   // Stamp categoryIds onto each mob from the seed regex table — the
   // daemon does this once at SpawnAdded time and never mutates it,
   // so we match that semantic here.
@@ -247,7 +301,7 @@ function startSession(ws: WebSocket): void {
   for (const p of buildPrefs()) session.prefs.set(`${p.section}|${p.key}`, p);
   sessions.set(ws, session);
 
-  console.log(`[demo] new session — player=${playerName} mobs=${mobs.length}`);
+  console.log(`[demo] new session — zone=${zone} player=${playerName} mobs=${mobs.length}`);
 
   // Build worn-set + totals once — the same data ships in the
   // Snapshot and on subsequent ItemCacheTotals/WornSet events.
@@ -262,8 +316,8 @@ function startSession(ws: WebSocket): void {
   // to "Loading <zone>…" → the long name), the geometry to render
   // on the map canvas, and every spawn including the player.
   const snapshot = create(SnapshotSchema, {
-    zoneShort: ZONE_SHORT,
-    zoneLong: ZONE_LONG,
+    zoneShort: zone,
+    zoneLong: zoneLong,
     playerId: PLAYER_ID,
     spawns: [playerSpawn, ...mobs.map((m) => m.spawn)],
     geometry: loaded.geometry,
@@ -449,7 +503,7 @@ function startSession(ws: WebSocket): void {
   }, TICK_MS);
 }
 
-function endSession(ws: WebSocket): void {
+function endSession(ws: WS): void {
   const s = sessions.get(ws);
   if (!s) return;
   if (s.ticker) clearInterval(s.ticker);
@@ -473,7 +527,7 @@ function snapshotFlags(s: Session): Map<number, number> {
 // for filter-flag mutations because the showeq-web store doesn't apply
 // filter_flags from SpawnUpdated.
 function recomputeAndEmit(
-  ws: WebSocket, s: Session, prev: Map<number, number>,
+  ws: WS, s: Session, prev: Map<number, number>,
 ): void {
   const send = (spawn: Spawn) => {
     spawn.filterFlags = computeFlags(s.filters, spawn);
@@ -487,7 +541,7 @@ function recomputeAndEmit(
   for (const m of s.mobs) send(m.spawn);
 }
 
-function sendFilterRules(ws: WebSocket, s: Session): void {
+function sendFilterRules(ws: WS, s: Session): void {
   ws.send(envelope(s, {
     case: 'filterRules',
     value: create(FilterRulesUpdateSchema, { rules: toWireRules(s.filters) }),
@@ -495,7 +549,7 @@ function sendFilterRules(ws: WebSocket, s: Session): void {
 }
 
 function addFilter(
-  ws: WebSocket, s: Session,
+  ws: WS, s: Session,
   filterType: number, pattern: string, perZone: boolean,
 ): void {
   const trimmed = pattern.trim();
@@ -514,7 +568,7 @@ function addFilter(
 }
 
 function removeFilter(
-  ws: WebSocket, s: Session,
+  ws: WS, s: Session,
   filterType: number, pattern: string, perZone: boolean,
 ): void {
   const idx = s.filters.rules.findIndex((r) =>
@@ -526,35 +580,42 @@ function removeFilter(
   sendFilterRules(ws, s);
 }
 
-const server = Bun.serve({
+const server = Bun.serve<WSData, never>({
   port: PORT,
   fetch(req, srv) {
-    if (srv.upgrade(req)) return;
+    // Parse `?m=<short>` from the upgrade URL. pickZone validates
+    // against the allowlist and falls back to a random zone if the
+    // requested short isn't on the list (or wasn't supplied).
+    // `?spawncount=N` controls how many NPCs the session simulates
+    // (default 14, capped at MAX_SPAWN_COUNT) — useful for poking at
+    // render perf in showeq-web.
+    const url = new URL(req.url);
+    const picked = pickZone(url.searchParams.get('m'));
+    const spawnCount = parseSpawnCount(url.searchParams.get('spawncount'));
+    if (srv.upgrade(req, { data: { ...picked, spawnCount } })) return;
     return new Response('showeq-web-demo: WebSocket only', { status: 426 });
   },
   websocket: {
-    open(ws) {
+    open(_ws) {
       // Wait for Subscribe before streaming — matches the daemon's
       // SessionAdapter contract; the showeq-web client sends it on open.
-      ws.binaryType = 'arraybuffer';
     },
     message(ws, data) {
       if (typeof data === 'string') return;
-      const bytes = data instanceof ArrayBuffer
-        ? new Uint8Array(data)
-        : new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+      // Bun's binary message arrives as Buffer (a Uint8Array subclass)
+      // — fromBinary accepts Uint8Array directly, so no copy needed.
+      const bytes = data;
       try {
         const env = fromBinary(ClientEnvelopeSchema, bytes);
-        const sock = ws as unknown as WebSocket;
-        const session = sessions.get(sock);
+        const session = sessions.get(ws);
         switch (env.payload.case) {
           case 'subscribe':
-            if (!session) startSession(sock);
+            if (!session) startSession(ws);
             break;
           case 'addFilterRule':
             if (session) {
               addFilter(
-                sock, session,
+                ws, session,
                 env.payload.value.filterType,
                 env.payload.value.pattern,
                 env.payload.value.perZone,
@@ -564,7 +625,7 @@ const server = Bun.serve({
           case 'removeFilterRule':
             if (session) {
               removeFilter(
-                sock, session,
+                ws, session,
                 env.payload.value.filterType,
                 env.payload.value.pattern,
                 env.payload.value.perZone,
@@ -581,7 +642,7 @@ const server = Bun.serve({
               const k = `${incoming.section}|${incoming.key}`;
               if (session.prefs.has(k)) {
                 session.prefs.set(k, incoming);
-                sock.send(envelope(session, {
+                ws.send(envelope(session, {
                   case: 'prefChanged',
                   value: create(PrefChangedSchema, { pref: incoming }),
                 }));
@@ -590,7 +651,7 @@ const server = Bun.serve({
             break;
           case 'listDevices':
             if (session) {
-              sock.send(envelope(session, {
+              ws.send(envelope(session, {
                 case: 'devicesList',
                 value: create(DevicesListSchema, { devices: buildDevices() }),
               }));
@@ -604,7 +665,7 @@ const server = Bun.serve({
               const sp = session.spawnPoints.get(env.payload.value.key);
               if (sp) {
                 sp.name = env.payload.value.name;
-                sock.send(envelope(session, {
+                ws.send(envelope(session, {
                   case: 'spawnPointUpdated',
                   value: create(SpawnPointUpdatedSchema, { point: sp }),
                 }));
@@ -617,7 +678,7 @@ const server = Bun.serve({
       }
     },
     close(ws) {
-      endSession(ws as unknown as WebSocket);
+      endSession(ws);
     },
   },
 });

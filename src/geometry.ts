@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { create } from '@bufbuild/protobuf';
@@ -231,13 +231,46 @@ export interface LoadResult {
   spawnAnchors: [number, number][];
 }
 
-// `<repo>/maps/`. Maps are vendored alongside the demo so it doesn't
-// depend on a populated ~/.showeq/maps install — the curl-and-run
-// experience is just `bun install && bun run gen && bun run start`.
-const MAPS_DIR = resolve(dirname(fileURLToPath(import.meta.url)), '..', 'maps');
+// Maps lookup uses a search path: the vendored `<repo>/maps/` dir
+// first (the curl-and-run experience), then `~/.showeq/maps/` if it
+// exists (so a developer with a full local install gets the entire
+// 599-zone pool to randomize across without re-vendoring).
+export const VENDORED_MAPS_DIR =
+  resolve(dirname(fileURLToPath(import.meta.url)), '..', 'maps');
+export const SYSTEM_MAPS_DIR =
+  resolve(process.env.HOME ?? '', '.showeq', 'maps');
+
+// Scan one or more dirs for `<short>.txt` files and return the unique
+// set of short names. The scan runs once at server startup; the
+// returned set is the immutable allowlist for `?m=<zone>` URL params.
+// Filesystem entries that aren't a `[a-z0-9_-]+\.txt` base file (e.g.
+// the `_1` / `_2` layer overlays, dotfiles, dirs) are skipped.
+export function scanZoneShorts(dirs: string[]): Set<string> {
+  const out = new Set<string>();
+  for (const d of dirs) {
+    if (!existsSync(d)) continue;
+    for (const name of readdirSync(d)) {
+      const m = name.match(/^([a-z0-9_-]+)\.txt$/);
+      if (!m) continue;
+      // Skip the layer overlays — they look like `<short>_1.txt` /
+      // `<short>_2.txt`. We only treat the base file as the canonical
+      // existence marker for a zone.
+      if (/_[12]$/.test(m[1])) continue;
+      out.add(m[1]);
+    }
+  }
+  return out;
+}
 
 export function loadZoneGeometry(zoneShort: string): LoadResult | null {
-  const dir = MAPS_DIR;
+  // Per-zone files always co-locate (a zone's three layer files live
+  // in the same dir), so resolve the dir once: vendored wins. Falling
+  // back to system maps means an "uncovered" zone — found in scan but
+  // not vendored — gets loaded transparently.
+  const dirs = [VENDORED_MAPS_DIR, SYSTEM_MAPS_DIR];
+  const dir = dirs.find((d) => existsSync(resolve(d, `${zoneShort}.txt`)));
+  if (!dir) return null;
+
   // Layer order: base → _1 → _2. Files that don't exist are skipped.
   const candidates: { path: string; layer: number }[] = [
     { path: resolve(dir, `${zoneShort}.txt`),   layer: 0 },

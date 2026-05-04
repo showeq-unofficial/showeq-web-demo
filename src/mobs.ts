@@ -36,10 +36,13 @@ const PC_FIRST_NAMES = [
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
-// Returns up to `max` distinct NPC names. Tries to read names out of
-// the local recorded `combat.pbstream` golden if present (the file
-// is gitignored — see CLAUDE.md / replay README), falls back to the
-// curated pool otherwise.
+// Returns `max` NPC names. Tries to read names out of the local
+// recorded `combat.pbstream` golden if present (the file is
+// gitignored — see CLAUDE.md / replay README), falls back to the
+// curated pool otherwise. When `max` exceeds the deduplicated pool
+// size (rendering-perf stress test via `?spawncount=`), the extras
+// are synthesized by cycling the pool with a 3-digit suffix
+// (e.g. `decaying skeleton, a #042`) so the names stay distinct.
 export function loadMobNames(max = 24): string[] {
   const candidate = resolve(
     __dirname,
@@ -54,6 +57,17 @@ export function loadMobNames(max = 24): string[] {
       seen.add(n);
       out.push(n);
       if (out.length >= max) break;
+    }
+  }
+  if (out.length < max && out.length > 0) {
+    const base = out.slice();
+    let suffix = 1;
+    while (out.length < max) {
+      for (const n of base) {
+        if (out.length >= max) break;
+        out.push(`${n} #${suffix.toString().padStart(3, '0')}`);
+      }
+      suffix++;
     }
   }
   return out;
