@@ -4,7 +4,7 @@
   "version": "0.0.1",
   "type": "module",
   "scripts": {
-    "gen": "buf generate ../showeq-proto",
+    "gen": "buf generate proto",
     "start": "bun run src/server.ts",
     "dev": "bun --watch run src/server.ts",
     "typecheck": "tsc --noEmit"

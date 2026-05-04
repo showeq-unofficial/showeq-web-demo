@@ -20,9 +20,10 @@ client connects unchanged.
 
 ```sh
 cd showeq-web-demo
+git submodule update --init   # one-time: pulls showeq-proto into proto/
 bun install
-bun run gen     # one-time: generate src/gen from ../showeq-proto
-bun run start   # listens on ws://localhost:9091
+bun run gen                   # generate src/gen from proto/
+bun run start                 # listens on ws://localhost:9091
 ```
 
 Then in `showeq-web` open Settings → Daemon URL, set it to
