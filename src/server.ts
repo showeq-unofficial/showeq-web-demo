@@ -79,7 +79,26 @@ if (ZONE_ALLOWLIST.size === 0) {
   process.exit(1);
 }
 const ZONE_LIST = [...ZONE_ALLOWLIST];
-console.log(`[demo] zone allowlist: ${ZONE_ALLOWLIST.size} zones`);
+// Random selection pool: drop names that aren't in the canonical
+// zones.h table. Filters out fan-made variants like
+// `lavastorm_original` and miscategorized files like
+// `nektulos_1_original` (a `_1` overlay that escaped the layer
+// regex because the suffix landed mid-name). Explicit `?m=<short>`
+// requests still see the full ZONE_ALLOWLIST, so a developer can
+// pin to a variant on purpose — they just don't get picked at
+// random.
+const ZONE_RANDOM_POOL = ZONE_LIST.filter((z) => z in ZONE_LONG_NAMES);
+if (ZONE_RANDOM_POOL.length === 0) {
+  console.error(
+    `[demo] no canonical zones in allowlist — every map file is a fan-made ` +
+    `variant. Vendor at least one zone known to showeq-daemon's zones.h.`,
+  );
+  process.exit(1);
+}
+console.log(
+  `[demo] zone allowlist: ${ZONE_ALLOWLIST.size} zones (` +
+  `${ZONE_RANDOM_POOL.length} canonical, eligible for random pick)`,
+);
 
 // Geometry parse runs once per zone — popular zones (or the same zone
 // re-picked by the random fallback) reuse the cached parse instead of
@@ -104,13 +123,14 @@ function pickZone(requested: string | null): { zone: string; loaded: LoadResult 
   }
   // Random fallback. Reroll up to a few times if a picked zone fails
   // to load; in practice the curated set parses cleanly so this
-  // should resolve on the first try.
+  // should resolve on the first try. Drawn from the canonical-only
+  // random pool, never the full allowlist.
   for (let i = 0; i < 8; i++) {
-    const z = ZONE_LIST[Math.floor(Math.random() * ZONE_LIST.length)];
+    const z = ZONE_RANDOM_POOL[Math.floor(Math.random() * ZONE_RANDOM_POOL.length)];
     const g = getGeometry(z);
     if (g) return { zone: z, loaded: g };
   }
-  throw new Error('[demo] no loadable zone in allowlist after 8 retries');
+  throw new Error('[demo] no loadable zone in random pool after 8 retries');
 }
 // Visible in the chat log so the demo doesn't feel empty even before
 // any mobs move.
@@ -332,9 +352,10 @@ function seedZoneEntities(
 function cycleZone(ws: WS, session: Session): void {
   // Pick a different random zone — bail if 8 retries can't find one
   // that isn't the current zone (effectively never with a 500+ list).
+  // Drawn from the canonical-only random pool to match pickZone.
   let next: { zone: string; loaded: LoadResult } | null = null;
   for (let i = 0; i < 8; i++) {
-    const z = ZONE_LIST[Math.floor(Math.random() * ZONE_LIST.length)];
+    const z = ZONE_RANDOM_POOL[Math.floor(Math.random() * ZONE_RANDOM_POOL.length)];
     if (z === session.zone) continue;
     const g = getGeometry(z);
     if (g) { next = { zone: z, loaded: g }; break; }
