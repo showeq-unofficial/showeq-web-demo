@@ -1,14 +1,30 @@
 import { create, fromBinary, toBinary } from '@bufbuild/protobuf';
 import {
+  BuffsUpdateSchema,
+  CategoriesUpdateSchema,
   ChatMessageSchema,
   CombatEventSchema,
+  ConsideredSchema,
+  DevicesListSchema,
   EnvelopeSchema,
   FilterRulesUpdateSchema,
+  GroupUpdateSchema,
+  ItemCacheTotalsSchema,
+  ItemLearnedSchema,
   PlayerStatsSchema,
+  PrefChangedSchema,
+  PrefsSnapshotSchema,
   SnapshotSchema,
   SpawnAddedSchema,
+  SpawnPointSchema,
+  SpawnPointUpdatedSchema,
   SpawnUpdatedSchema,
+  TargetedSchema,
+  WornSetSchema,
+  type Buff,
+  type Pref,
   type Spawn,
+  type SpawnPoint,
 } from '@gen/seq/v1/events_pb';
 import { ClientEnvelopeSchema } from '@gen/seq/v1/client_pb';
 import { loadZoneGeometry } from './geometry.ts';
@@ -21,6 +37,19 @@ import {
   toWireRules,
   type FilterState,
 } from './filters.ts';
+import {
+  buildAA,
+  buildBuffs,
+  buildCategories,
+  buildDevices,
+  buildGroup,
+  buildItems,
+  buildPrefs,
+  buildSkills,
+  categoryIdsForName,
+  summedTotals,
+  WORN_SEED,
+} from './seed.ts';
 
 const PORT = Number(process.env.PORT ?? 9091);
 const ZONE_SHORT = process.env.ZONE ?? 'nektulos';
@@ -83,6 +112,15 @@ interface Session {
   // In-memory FilterMgr. Per the user's brief, filter rules are not
   // persisted — they reset on every connection.
   filters: FilterState;
+  // Per-session in-memory pref store keyed by `${section}|${key}` so
+  // SetPref echoes update the same record we sent in PrefsSnapshot.
+  prefs: Map<string, Pref>;
+  // Buffs ticked down locally so the BuffsPanel countdown moves
+  // visibly during a demo session.
+  buffs: Buff[];
+  // SpawnPoints keyed by SpawnPoint.key. Populated from a small
+  // sample of map anchors so SpawnPointList isn't empty.
+  spawnPoints: Map<string, SpawnPoint>;
   // Monotonic envelope sequence — clients use this to detect gaps and
   // drive the resume protocol (Subscribe.last_seq), but the demo's
   // session_id is empty so resume falls back to a fresh Snapshot every
@@ -164,6 +202,34 @@ function startSession(ws: WebSocket): void {
     ? loaded.spawnAnchors.slice(1)
     : loaded.spawnAnchors;
   const mobs = buildMobs(names, mobAnchors, ZONE_BOUNDS);
+  // Stamp categoryIds onto each mob from the seed regex table — the
+  // daemon does this once at SpawnAdded time and never mutates it,
+  // so we match that semantic here.
+  for (const m of mobs) {
+    m.spawn.categoryIds = categoryIdsForName(m.spawn.name);
+  }
+  // Promote a small sample of mob anchors into spawn points so the
+  // SpawnPointList renders something. Real SpawnMonitor only promotes
+  // after the second pop at the same coords; the demo skips that
+  // (n=1) and just seeds points directly from the mob set.
+  const spawnPoints = new Map<string, SpawnPoint>();
+  const nowS = BigInt(Math.floor(Date.now() / 1000));
+  for (const m of mobs.slice(0, 6)) {
+    const x = m.spawn.pos!.x, y = m.spawn.pos!.y, z = m.spawn.pos!.z;
+    const key = `${x}|${y}|${z}`;
+    spawnPoints.set(key, create(SpawnPointSchema, {
+      key, x, y, z,
+      name: '',
+      last: m.spawn.name,
+      lastId: m.spawn.id,
+      count: 1,
+      spawnTimeS: nowS,
+      // diff_time_s = 360 mimics a 6-minute respawn cycle so the
+      // SpawnPointList countdown column is non-empty.
+      deathTimeS: 0n,
+      diffTimeS: 360n,
+    }));
+  }
   const session: Session = {
     filters: emptyFilterState(),
     player: playerSpawn,
@@ -171,11 +237,26 @@ function startSession(ws: WebSocket): void {
     waypoints,
     waypointIdx: 0,
     mobs,
+    prefs: new Map(),
+    buffs: buildBuffs(PLAYER_ID, playerName),
+    spawnPoints,
     seq: 0n,
   };
+  // Seed the pref store before sending the snapshot — handle messages
+  // arriving on the same socket race the snapshot otherwise.
+  for (const p of buildPrefs()) session.prefs.set(`${p.section}|${p.key}`, p);
   sessions.set(ws, session);
 
   console.log(`[demo] new session — player=${playerName} mobs=${mobs.length}`);
+
+  // Build worn-set + totals once — the same data ships in the
+  // Snapshot and on subsequent ItemCacheTotals/WornSet events.
+  const wornSet = create(WornSetSchema, {
+    slotIndices: WORN_SEED.map((w) => w.slot),
+    itemIds: WORN_SEED.map((w) => w.item.id),
+  });
+  const totals = summedTotals();
+  const itemTotals = create(ItemCacheTotalsSchema, totals);
 
   // Snapshot first: tells the client the zone (so the title bar updates
   // to "Loading <zone>…" → the long name), the geometry to render
@@ -186,23 +267,59 @@ function startSession(ws: WebSocket): void {
     playerId: PLAYER_ID,
     spawns: [playerSpawn, ...mobs.map((m) => m.spawn)],
     geometry: loaded.geometry,
-    spawnPoints: [],
+    spawnPoints: [...session.spawnPoints.values()],
+    items: buildItems(),
+    itemTotals,
+    wornSet,
     sessionId: '',
   });
   ws.send(envelope(session, { case: 'snapshot', value: snapshot }));
 
-  // PlayerStats so the StatsPanel populates.
+  // PlayerStats so the StatsPanel populates. Skills + purchased_aa
+  // make the SkillsWindow and AAWindow render real rows; aa_unspent
+  // gives AAWindow's "points to spend" header a non-zero value.
   const stats = create(PlayerStatsSchema, {
     name: playerName,
     class: 1, race: 1, level: 25,
     hpCur: 850, hpMax: 850,
     manaCur: 600, manaMax: 600,
-    staminaCur: 100, staminaMax: 100,
+    enduranceCur: 100, enduranceMax: 100,
     expCur: 12_500_000, expMax: 25_000_000,
-    aaExpCur: 0, aaExpMax: 15_000_000, aaPoints: 0,
+    aaExpCur: 4_200_000, aaExpMax: 15_000_000,
+    aaPoints: 14, aaUnspent: 3,
     str: 95, sta: 95, agi: 95, dex: 90, wis: 80, int: 80, cha: 75,
+    skills: buildSkills(),
+    purchasedAa: buildAA(),
   });
   ws.send(envelope(session, { case: 'playerStats', value: stats }));
+
+  // Categories drive the per-spawn category_ids tags emitted on every
+  // mob in the snapshot — send the index right after so the client can
+  // resolve those ids to display names.
+  ws.send(envelope(session, {
+    case: 'categories',
+    value: create(CategoriesUpdateSchema, { categories: buildCategories() }),
+  }));
+
+  // Group, buffs, prefs — all panel-feeding broadcasts the daemon
+  // sends on Subscribe.
+  ws.send(envelope(session, {
+    case: 'group',
+    value: create(GroupUpdateSchema, { members: buildGroup() }),
+  }));
+  ws.send(envelope(session, {
+    case: 'buffs',
+    value: create(BuffsUpdateSchema, {
+      capturedMs: BigInt(Date.now()),
+      buffs: session.buffs,
+    }),
+  }));
+  ws.send(envelope(session, {
+    case: 'prefs',
+    value: create(PrefsSnapshotSchema, {
+      prefs: [...session.prefs.values()],
+    }),
+  }));
 
   // Send an initial empty FilterRulesUpdate so FilterRulesPanel renders
   // its add-row UI right away. Daemon does the same on Subscribe so
@@ -283,6 +400,51 @@ function startSession(ws: WebSocket): void {
           }));
         }
       }
+    }
+
+    // Every ~7s, fire a Targeted event toggled with a Considered. Real
+    // sessions emit one when the user clicks a mob; the demo cycles
+    // through mobs so the SpawnList highlight moves on its own.
+    if (tickCount % 35 === 17 && session.mobs.length > 0) {
+      const m = session.mobs[Math.floor(Math.random() * session.mobs.length)];
+      ws.send(envelope(session, {
+        case: 'targeted',
+        value: create(TargetedSchema, { spawnId: m.spawn.id }),
+      }));
+      ws.send(envelope(session, {
+        case: 'considered',
+        value: create(ConsideredSchema, { spawnId: m.spawn.id }),
+      }));
+    }
+
+    // Every ~5s, re-emit the BuffsUpdate with decremented durations so
+    // the BuffsPanel countdown ticks visibly. When a buff hits 0 we
+    // recycle it to the seed value so the panel stays populated.
+    if (tickCount % 25 === 0) {
+      for (const b of session.buffs) {
+        b.durationS = b.durationS > 30 ? b.durationS - 5 : 1500;
+      }
+      ws.send(envelope(session, {
+        case: 'buffs',
+        value: create(BuffsUpdateSchema, {
+          capturedMs: BigInt(Date.now()),
+          buffs: session.buffs,
+        }),
+      }));
+    }
+
+    // Every ~10s, "respawn" one spawn point: bump count + spawn_time_s
+    // so the SpawnPointList table shows live updates.
+    if (tickCount % 50 === 0 && session.spawnPoints.size > 0) {
+      const keys = [...session.spawnPoints.keys()];
+      const k = keys[Math.floor(Math.random() * keys.length)];
+      const sp = session.spawnPoints.get(k)!;
+      sp.count += 1;
+      sp.spawnTimeS = BigInt(Math.floor(Date.now() / 1000));
+      ws.send(envelope(session, {
+        case: 'spawnPointUpdated',
+        value: create(SpawnPointUpdatedSchema, { point: sp }),
+      }));
     }
   }, TICK_MS);
 }
@@ -409,7 +571,46 @@ const server = Bun.serve({
               );
             }
             break;
-          // setPref is ignored — the demo has no PrefsBroker to mutate.
+          case 'setPref':
+            // Mirror PrefsBroker: validate-by-allowlist (we accept
+            // anything the client already saw in PrefsSnapshot),
+            // overwrite the in-memory copy, then broadcast a
+            // PrefChanged echo to the originator. No XML persistence.
+            if (session && env.payload.value.pref) {
+              const incoming = env.payload.value.pref;
+              const k = `${incoming.section}|${incoming.key}`;
+              if (session.prefs.has(k)) {
+                session.prefs.set(k, incoming);
+                sock.send(envelope(session, {
+                  case: 'prefChanged',
+                  value: create(PrefChangedSchema, { pref: incoming }),
+                }));
+              }
+            }
+            break;
+          case 'listDevices':
+            if (session) {
+              sock.send(envelope(session, {
+                case: 'devicesList',
+                value: create(DevicesListSchema, { devices: buildDevices() }),
+              }));
+            }
+            break;
+          case 'renameSpawnPoint':
+            // Apply to the in-memory map and echo a SpawnPointUpdated
+            // back so the client sees the rename even though the demo
+            // doesn't persist anything.
+            if (session) {
+              const sp = session.spawnPoints.get(env.payload.value.key);
+              if (sp) {
+                sp.name = env.payload.value.name;
+                sock.send(envelope(session, {
+                  case: 'spawnPointUpdated',
+                  value: create(SpawnPointUpdatedSchema, { point: sp }),
+                }));
+              }
+            }
+            break;
         }
       } catch (err) {
         console.warn('[demo] failed to decode ClientEnvelope', err);
